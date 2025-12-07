@@ -20,11 +20,16 @@ ENV/
 .ipynb_checkpoints/
 
 # Data files (если не хотите коммитить большие файлы)
-# data/train.csv
-# data/test.csv
+data/train.csv
+data/test.csv
+data/submission.csv
 
 # Results (submission создается автоматически)
 results/submission.csv
+results/
+models/
+models_ce_minilm/
+cache/
 
 # Docker
 *.tar
