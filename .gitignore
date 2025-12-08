@@ -30,6 +30,8 @@ results/
 models/
 models_ce_minilm/
 cache/
+catboost_info
+checkpoints
 
 # Docker
 *.tar

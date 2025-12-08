@@ -1,127 +1,247 @@
-# 🎯 Шаблон проекта для соревнования
+# 🎯 AMML ranking competition
 
-Это шаблон проекта для формирования решения соревнования.
+> Решение задачи ранжирования товаров по поисковым запросам с использованием градиентного бустинга и cross-encoder моделей
 
-## 📋 Что нужно сделать
+---
 
-### Шаг 1: Установка Docker
+## 📋 О проекте
 
-**Если у вас Windows:**
-1. Скачайте Docker Desktop: https://www.docker.com/products/docker-desktop
-2. Установите Docker Desktop
-3. Запустите Docker Desktop (он должен быть запущен в фоне)
-4. Проверьте установку: откройте PowerShell и введите:
-   ```powershell
-   docker --version
-   ```
-   Вы должны увидеть версию Docker, например: `Docker version 24.0.6`
+**Вход:** Поисковый запрос + карточка товара  
+**Таргет:** Релевантность `relevance` ∈ {0, 1, 2, 3}  
+**Метрика:** nDCG@10 (по группам `query_id`)
 
-**Если у вас Mac:**
-1. Скачайте Docker Desktop для Mac: https://www.docker.com/products/docker-desktop
-2. Установите и запустите Docker Desktop
-3. Проверьте установку в терминале:
-   ```bash
-   docker --version
-   ```
+### 📊 Данные
+- `train.csv` — ~49k строк с таргетом
+- `test.csv` — ~21k строк без таргета
+- `submission.csv` — формат сабмита (id/prediction)
 
-**Если у вас Linux:**
-1. Следуйте официальной инструкции: https://docs.docker.com/engine/install/
-2. Проверьте установку:
-   ```bash
-   docker --version
-   ```
+---
 
-### Шаг 2: Скачивание и переименование проекта
+## 🏗️ Архитектура решения
 
-1. Скачайте этот проект с GitHub
-2. **ВАЖНО:** Переименуйте папку проекта на ваше `фамилия-имя` латиницей (например, `petrov-ivan`)
-3. Откройте папку проекта в любом редакторе (VS Code, PyCharm и т.д.)
-
-### Шаг 3: Разработка решения
-
-#### 3.1. Укажите ваши зависимости
-
-Откройте файл `requirements.txt` и:
-- Зафиксируйте нужные библиотеки с версиями (символ `#` в начале строки не нужен!)
-- **ВАЖНО:** Указывайте точные версии пакетов (например, `scikit-learn==1.3.2`)
-
-Пример `requirements.txt`:
 ```
-pandas==2.1.3
-numpy==1.26.2
-scikit-learn==1.3.2
-xgboost==2.0.2
+┌─────────────────┐
+│   Raw Data      │
+│  (train/test)   │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Preprocessing  │ ◄─── HTML очистка, нормализация, обрезка
+│  (clean_text)   │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│    Features     │ ◄─── BM25, E5 embeddings, CE scores, TE
+│  Engineering    │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│   CatBoost      │ ◄─── GroupKFold, YetiRank loss
+│   Ensemble      │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│   CE Blend      │ ◄─── Смешивание CatBoost + CE scores из фичей
+│  (ce_blend_w)   │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  CE Rerank      │ ◄─── Fine-tuned MiniLM (опционально)
+│  (top-K)        │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Submission     │
+└─────────────────┘
 ```
 
-#### 3.2. Напишите ваше решение
+---
 
-Откройте файл `main.py` и заполните его вашей загрузкой, предобработкой, процессингом и сохранением файла:
+## 🔧 Компоненты пайплайна
 
-**⚠️ НЕ ЗАБУДЬТЕ ЗАПИСАТЬ функцию `create_submission()` - она создает ответ он должен быть в формате SAMPLE SUBMISSION!**
+### 1️⃣ **Препроцессинг** (`src/preprocessing.py`)
+- 🧹 Очистка HTML-тегов и entities (`clean_text`)
+- ✂️ Удаление пунктуации/цифр в начале запросов
+- 🔄 Нормализация плейсхолдеров (`none`/`[null]`/`brand_masked` → `""`)
+- 📏 Релевантное окно ±160 символов для длинных полей
+- 🎨 Нормализация брендов и цветов
+- 🗑️ Удаление константных признаков (`product_locale`)
 
-В корень проекта можно сохранять другие скрипты, на которые идёт ссылка вашего решения в main.py, а также ноутбуки с анализом данных.
+### 2️⃣ **Feature Engineering** (`src/features.py`)
+- **Текстовые метрики:**
+  - BM25 по title/description/bullet_point/all
+  - Jaccard similarity, Levenshtein distance
+  - Coverage, числовые совпадения
+  
+- **Семантические фичи:**
+  - E5 embeddings (`intfloat/multilingual-e5-large-instruct`)
+  - Cosine similarity для title/desc/bullet/all
+  - Комбинированные фичи: title+brand+color
+  
+- **Cross-encoder:**
+  - BGE-reranker-v2-m3 скоры (кешируются)
+  
+- **Target Encoding:**
+  - TE для `product_id`, `product_title`, `query`
+  
+- **Категориальные:**
+  - Подготовка для CatBoost (brand, color)
 
-### Шаг 4: Тестирование решения локально (без Docker)
+### 3️⃣ **Обучение CatBoost** (`src/train.py`)
+- 📊 GroupKFold по `query_id` (seed: 993)
+- 🎯 Loss: YetiRank (оптимизирован для ранжирования)
+- 💾 Сохранение: фолды `catboost_fold*.cbm` + `metadata.json`
 
-Перед сборкой Docker-образа убедитесь, что код работает:
+### 4️⃣ **Инференс** (`src/inference.py`)
+- 🔄 Препроцессинг + фичи
+- 🤖 CatBoost ансамбль
+- 🔀 Опциональный CE blend (`ce_blend_weight`)
+- 🔝 CE rerank top-K (fine-tuned MiniLM)
 
-```powershell
-# Создайте виртуальное окружение (опционально)
-python -m venv venv
-venv\Scripts\activate
+### 5️⃣ **Cross-Encoder Training** (`src/ce_train.py`)
+- 🎓 Fine-tuning MiniLM (2 эпохи, max_len=160)
+- 📦 Сохранение в `models_ce_minilm/`
 
-# Установите зависимости
+---
+
+## 🚀 Быстрый старт
+
+### Установка
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Linux/Mac
+# или
+.venv\Scripts\activate     # Windows
+
 pip install -r requirements.txt
-
-# Запустите решение
-python main.py
 ```
 
-После выполнения в папке `results/` должен появиться файл `submission.csv` с вашими предсказаниями.
-
-### Шаг 5: Сборка Docker-образа
-
-Когда ваше решение готово и работает локально:
-
-1. Откройте PowerShell (Windows) или терминал (Mac/Linux)
-2. Перейдите в папку проекта:
-   ```powershell
-   cd путь\к\папке\проекта
-   ```
-3. Соберите Docker-образ (замените `Petrov-Ivan` на вашу фамилию-имя):
-   ```powershell
-   docker build -t petrov-ivan-solution .
-   ```
-
-Это займет несколько минут при первом запуске.
-
-**Важные моменты:**
-- В команде есть точка `.` в конце - не забудьте её!
-- Имя образа (`petrov-ivan-solution`) должно быть маленькими буквами
-- Используйте дефис `-` вместо пробела
-
-### Шаг 6: Проверка Docker-образа
-
-Запустите ваш Docker-контейнер:
-
-```powershell
-docker run --rm petrov-ivan-solution
+### Запуск полного цикла
+```bash
+python main.py --mode full \
+  --train-path data/train.csv \
+  --test-path data/test.csv \
+  --models-dir models \
+  --submission-path results/submission.csv
 ```
 
-Вы должны увидеть вывод вашей программы. Если есть ошибки - исправьте их и повторите сборку.
+> 💡 **Совет:** Фичи и CE-скоры кэшируются в `cache/` для ускорения повторных запусков
 
-### Шаг 7: Сохранение Docker-образа в файл
+---
 
-Когда все работает, сохраните образ в файл для отправки:
+## 🎮 Режимы работы `main.py`
 
-```powershell
-docker save -o petrov-ivan-solution.tar petrov-ivan-solution
+| Режим | Описание |
+|-------|----------|
+| `train` | Обучение CatBoost на train.csv |
+| `infer` | Инференс на test.csv → submission.csv |
+| `ce-train` | Fine-tuning Cross-Encoder MiniLM |
+| `full` | Полный цикл: train → ce-train (если нужно) → infer |
+| `rerank` | Применение CE rerank к готовому submission.csv |
+
+### Примеры команд
+
+**Обучение CatBoost:**
+```bash
+python main.py --mode train \
+  --train-path data/train.csv \
+  --models-dir models \
+  --iterations 2000 \
+  --learning-rate 0.03 \
+  --depth 8
 ```
 
-Это создаст файл `petrov-ivan-solution.tar` в текущей папке.
+**Инференс с CE rerank:**
+```bash
+python main.py --mode infer \
+  --test-path data/test.csv \
+  --models-dir models \
+  --submission-path results/submission.csv \
+  --ce-model-dir models_ce_minilm \
+  --ce-rerank-top-k 200 \
+  --ce-rerank-weight 0.4
+```
 
-### Шаг 8: Отправка решения
+---
 
-Отправьте преподавателю ссылку на гитхаб репозиторий с загруженным проектом (проект должен называться в формате `petrov-ivan`)
+## 🐳 Docker
 
+Сборка и запуск инференса:
 
+```bash
+# Сборка образа
+docker build -t maksim-lyara-solution .
+
+# Запуск (data/ должен быть примонтирован)
+docker run --rm \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/results:/app/results \
+  maksim-lyara-solution
+```
+
+Итоговый файл: `results/submission.csv`
+
+---
+
+## 📁 Структура проекта
+
+```
+.
+├── src/                     # Основной код
+│   ├── preprocessing.py     # Очистка и нормализация данных
+│   ├── features.py          # Генерация признаков
+│   ├── train.py             # Обучение CatBoost
+│   ├── inference.py         # Инференс
+│   ├── ce_train.py          # Обучение Cross-Encoder
+│   └── rerank.py            # CE rerank
+│
+├── data/                     # Данные
+│   ├── train.csv
+│   └── test.csv
+│
+├── models/                   # CatBoost модели
+│   ├── catboost_fold*.cbm
+│   └── metadata.json
+│
+├── models_ce_minilm/         # Fine-tuned CE
+│
+├── cache/                    # Кэш эмбеддингов и CE скоров
+│
+├── notebooks/                # EDA и эксперименты
+│   └── eda.ipynb
+│
+├── results/                  # Результаты
+│   └── submission.csv
+│
+├── main.py                   # Точка входа
+└── requirements.txt          # Зависимости
+```
+
+---
+
+## 💡 Ключевые особенности
+
+- ✅ **Фиксированный seed (993)** для воспроизводимости
+- ✅ **Нормализация train/test** для устранения data leakage
+- ✅ **Умная обрезка текста** — релевантное окно ускоряет обработку
+- ✅ **Кэширование** — эмбеддинги и CE скоры переиспользуются
+- ✅ **Гибкий блендинг** — настраиваемые веса для CatBoost + CE
+- ✅ **Production-ready** — Docker-контейнер для деплоя
+
+---
+
+## 📚 Дополнительная информация
+
+Подробный EDA и обоснование выбора препроцессинга: `notebooks/eda.ipynb`
+
+---
+
+## 👤 Автор
+
+**Maksim Lyara** — решение для AMML ranking competition
