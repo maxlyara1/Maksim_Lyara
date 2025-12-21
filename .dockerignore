@@ -9,6 +9,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+catboost_info
 
 # Виртуальные окружения
 venv/
