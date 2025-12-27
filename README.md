@@ -51,42 +51,43 @@
 flowchart TD
     A["Загрузка данных<br/>train.csv, test.csv"] --> B["Подготовка таргетов<br/>mid/spread + log1p"]
     B --> C["Окно обучения<br/>последние 90 дней"]
-    C --> D["Feature Engineering (train + test)"]
-
-    subgraph FE["Feature Engineering (train + test)"]
-        FE1["Кластеры товаров<br/>RobustScaler + KMeans"]
-        FE2["Target Encoding<br/>KFold для иерархий + product_id"]
-        FE3["Контекстные признаки<br/>dow, day, rel_vol, act_x_clust"]
-        FE4["Аномалии<br/>IsolationForest"]
-        FE1 --> FE2 --> FE3 --> FE4
-    end
-
-    D --> E["Proxy validation split"]
-    E --> E1["Proxy new products<br/>стратификация по management_group_id"]
-    E --> E2["Train: все, кроме последних 30 дней<br/>и без proxy new"]
-    E --> E3["Val: последние 30 дней<br/>(включая proxy new)"]
-
-    E2 --> F["Обучение ансамбля (9 сидов)"]
+    C --> D1["Кластеризация товаров<br/>KMeans k=5"]
+    C --> D2["Target Encoding<br/>KFold для иерархий"]
+    C --> D3["Контекстные признаки<br/>dow, day, rel_vol, act_x_clust"]
+    C --> D4["Детекция аномалий<br/>IsolationForest"]
+    
+    D1 --> E["Proxy validation split"]
+    D2 --> E
+    D3 --> E
+    D4 --> E
+    
+    E --> E1["Proxy new products<br/>240 товаров, стратификация"]
+    E --> E2["Train: без последних 30 дней<br/>и без proxy new"]
+    E --> E3["Val: последние 30 дней<br/>включая proxy new"]
+    
+    E2 --> F["Обучение ансамбля<br/>9 сидов × 2 типа моделей"]
     E3 --> F
-
-    subgraph ENS["Каждый сид = 2 модели"]
-        ENS1["Uncertainty model<br/>RMSEWithUncertainty"]
-        ENS2["Quantile model<br/>MultiQuantile"]
-        ENS1 --> ENS3["Refit на полном train<br/>+15% итераций"]
-        ENS2 --> ENS4["Refit на полном train<br/>+15% итераций"]
-    end
-
-    F --> ENS --> G["Усреднение предсказаний ансамбля"]
+    
+    F --> F1["Uncertainty models<br/>RMSEWithUncertainty"]
+    F --> F2["Quantile models<br/>MultiQuantile"]
+    
+    F1 --> F3["Refit на полном train<br/>+15% итераций"]
+    F2 --> F3
+    
+    F3 --> G["Усреднение предсказаний<br/>18 моделей"]
     G --> H["Блендинг mu/sigma<br/>grid search весов"]
-    H --> I["Калибровка гамм интервалов"]
-    I --> I1["Глобальные гаммы: новые / старые"]
-    I --> I2["Новые: group gammas<br/>management_group_id + boost"]
-    I --> I3["Старые: кластеры<br/>cluster + activity"]
-    I1 --> J["EWM-сглаживание<br/>отдельные alpha для новых/старых"]
+    H --> I["Калибровка гамм<br/>иерархическая"]
+    
+    I --> I1["Глобальные: новые/старые"]
+    I --> I2["Новые: по management_group_id"]
+    I --> I3["Старые: по cluster + activity"]
+    
+    I1 --> J["EWM-сглаживание<br/>разные alpha"]
     I2 --> J
     I3 --> J
-    J --> K["Финальные интервалы для test"]
-    K --> L["Запись results/submission.csv"]
+    
+    J --> K["Финальные интервалы<br/>для test"]
+    K --> L["results/submission.csv"]
 ```
 
 ### Ключевые особенности
