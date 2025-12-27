@@ -12,7 +12,6 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import KFold
 from tqdm import tqdm
 
-# Проверка наличия CatBoost (обязательная зависимость)
 try:
     from catboost import CatBoostRegressor
 except ImportError:
@@ -25,7 +24,7 @@ class Config:
     test_path: str = "data/test.csv"
     submission_path: str = "results/submission.csv"
 
-    # Ensemble seeds and system seed
+    # Сиды для ансамбля и системный сид
     system_seed: int = 322
     ensemble_seeds: Tuple[int, ...] = (322, 322, 322, 322, 322, 322, 322, 322, 322)
 
@@ -43,7 +42,7 @@ class Config:
     q_depth: int = 6
     q_l2: float = 5.0
 
-    # Ensemble diversity knobs (depth + sampling)
+    # Параметры разнообразия ансамбля
     ensemble_depth_offsets: Tuple[int, ...] = (-2, -1, 0, 1, 2, -2, -1, 0, 1)
     ensemble_rsm: Tuple[float, ...] = (0.9, 0.95, 1.0, 0.9, 0.85, 0.8, 0.88, 0.75, 0.92)
     ensemble_bootstrap: Tuple[str, ...] = (
@@ -56,7 +55,7 @@ class Config:
     # Общие параметры моделей
     min_data_in_leaf: int = 20
     
-    # Feature Engineering
+    # Генерация признаков
     smoothing: float = 50.0
     n_clusters: int = 5
     
@@ -66,7 +65,7 @@ class Config:
     blend_sigma: float = 0.5
     new_gamma_boost: float = 1.04
     
-    # Сетки поиска (Grid Search)
+    # Сетки поиска
     tune_blend: bool = True
     blend_mu_grid: Tuple[float, ...] = (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8)
     blend_sigma_grid: Tuple[float, ...] = (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8)
@@ -102,29 +101,20 @@ def set_seed(seed: int):
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 def get_device_type() -> str:
-    """Определяет доступное устройство: GPU (CUDA) -> MPS (Mac) -> CPU"""
+    """Определяет доступное устройство: GPU -> CPU"""
     try:
         from catboost.utils import get_gpu_device_count
         if get_gpu_device_count() > 0:
             return "GPU"
     except Exception:
         pass
-    
-    # Проверка MPS (Metal Performance Shaders) для macOS
-    # CatBoost напрямую MPS не поддерживает для обучения, но определим это для логики
-    try:
-        import torch
-        if torch.backends.mps.is_available():
-            return "CPU" # CatBoost пока не умеет в MPS нативно, фолбэк на CPU
-    except ImportError:
-        pass
         
     return "CPU"
 
 def create_submission(predictions: pd.DataFrame | np.ndarray) -> str:
     """
-    Создание файла submission.csv в папке results.
-    Требование преподавателя: наличие этой функции.
+    Пропишите здесь создание файла submission.csv в папку results
+    !!! ВНИМАНИЕ !!! ФАЙЛ должен иметь именно такого названия
     """
     cfg = Config()
     if not isinstance(predictions, pd.DataFrame):
@@ -171,13 +161,14 @@ class PricingModel:
         kf = KFold(n_splits=5, shuffle=True, random_state=self.cfg.system_seed)
         global_mean = train_df[target].mean()
         
-        # Для трейна считаем фолдами
+        # Для трейна считаем фолдами, чтобы избежать утечки данных
         for tr_idx, val_idx in kf.split(train_df):
             X_tr, X_val = train_df.iloc[tr_idx], train_df.iloc[val_idx]
             stats = X_tr.groupby(col)[target].agg(["mean", "count"])
             
             m = X_val[col].map(stats["mean"])
             c = X_val[col].map(stats["count"]).fillna(0)
+            # Байесовское сглаживание: взвешенное среднее между групповым средним и глобальным
             train_res[val_idx] = (m * c + self.cfg.smoothing * global_mean) / (c + self.cfg.smoothing)
             
         # Для теста берем статистику со всего трейна
@@ -207,7 +198,7 @@ class PricingModel:
         kmeans = KMeans(n_clusters=self.cfg.n_clusters, random_state=self.cfg.system_seed, n_init=10)
         aggs["cluster_id"] = kmeans.fit_predict(X_cluster)
         
-        # Мердж кластеров (для новых товаров используем моду)
+        # Для новых товаров в тесте используем самый частый кластер как fallback
         common_cluster = aggs["cluster_id"].mode()[0]
         
         tr = tr.merge(aggs[["cluster_id"]], on="product_id", how="left")
@@ -226,9 +217,9 @@ class PricingModel:
         for df in [tr, ts]:
             df["dow"] = df["dt"].dt.dayofweek
             df["day"] = df["dt"].dt.day
-            # Относительный объем
+            # Относительный объем: как товар соотносится со своей категорией
             df["rel_vol"] = df["te_lvl_product_id"] / (df["te_lvl_third_category_id"] + 1e-9)
-            # Взаимодействие активности и кластера
+            # Взаимодействие активности и кластера: разные кластеры по-разному реагируют на акции
             df["act_x_clust"] = df["activity_flag"] * df["cluster_id"]
 
         # 4. Детекция аномалий
@@ -248,10 +239,10 @@ class PricingModel:
         return np.maximum(0, p_l), np.maximum(p_l + 1e-6, p_h)
 
     def _optimize_gammas(self, mu, sigma, true_l, true_h):
-        """Жадный поиск оптимальных множителей Gamma."""
+        """Жадный поиск оптимальных множителей Gamma для асимметричных интервалов."""
         grid = np.linspace(self.cfg.gamma_min, self.cfg.gamma_max, self.cfg.gamma_steps)
         
-        # Оптимизируем верхнюю границу
+        # Сначала оптимизируем верхнюю границу (при нижней = 1.0)
         best_h, best_s = 1.0, -1.0
         for h in grid:
             pl, ph = self._get_asymmetric_preds(mu, sigma, 1.0, h)
@@ -259,7 +250,7 @@ class PricingModel:
             if score > best_s:
                 best_s, best_h = score, h
                 
-        # Оптимизируем нижнюю границу (при фиксированной верхней)
+        # Затем оптимизируем нижнюю границу при найденной верхней
         best_l, best_s = 1.0, -1.0
         for l in grid:
             pl, ph = self._get_asymmetric_preds(mu, sigma, l, best_h)
@@ -279,16 +270,17 @@ class PricingModel:
             "dt": df["dt"],
             "p05": p05,
             "p95": p95,
-            "idx": np.arange(len(df))
+            "idx": np.arange(len(df))  # Сохраняем исходный порядок для восстановления
         })
-        # Сортируем по времени для корректного EWM
+        # Сортируем по времени для корректного экспоненциального сглаживания
         temp = temp.sort_values(by=["product_id", "dt"])
         
+        # Сглаживаем по каждому товару отдельно
         grouped = temp.groupby("product_id", sort=False)
         temp["p05"] = grouped["p05"].transform(lambda x: x.ewm(alpha=alpha, adjust=False).mean())
         temp["p95"] = grouped["p95"].transform(lambda x: x.ewm(alpha=alpha, adjust=False).mean())
         
-        # Возвращаем в исходном порядке
+        # Возвращаем в исходном порядке (как в test_df)
         temp = temp.sort_values(by="idx")
         return temp["p05"].values, temp["p95"].values
 
@@ -298,7 +290,7 @@ class PricingModel:
         train_full = pd.read_csv(self.cfg.train_path, parse_dates=["dt"])
         test_df = pd.read_csv(self.cfg.test_path, parse_dates=["dt"])
         
-        # Подготовка таргетов (log-space)
+        # Подготовка таргетов в логарифмической шкале
         train_full["price_mid"] = (train_full["price_p05"] + train_full["price_p95"]) / 2.0
         train_full["price_spread"] = train_full["price_p95"] - train_full["price_p05"]
         train_full["log_mid"] = np.log1p(train_full["price_mid"])
@@ -320,12 +312,12 @@ class PricingModel:
             "first_category_id", "second_category_id", "third_category_id"
         ]
         
-        # --- ВАЛИДАЦИЯ (PROXY) ---
         dates = sorted(train_df["dt"].unique())
         v_dates = dates[-self.cfg.proxy_days:]
         t_dates = dates[:-self.cfg.proxy_days]
         
-        # Выделяем "proxy new products" для симуляции холодного старта
+        # Выделяем прокси новых товаров для симуляции холодного старта
+        # Стратифицируем по management_group_id, чтобы распределение было похоже на тест
         rng = np.random.default_rng(self.cfg.system_seed)
         train_products = train_df["product_id"].unique()
         train_prod_mode_mg = (
@@ -338,17 +330,21 @@ class PricingModel:
             .groupby("product_id")["management_group_id"]
             .agg(lambda s: s.mode().iat[0])
         )
+        # Распределение management_group_id среди новых товаров в тесте
         mg_probs = test_new_mode_mg.value_counts(normalize=True)
 
+        # Вычисляем количество товаров для каждого management_group_id
         target_n = int(round(self.cfg.proxy_new_products * self.cfg.proxy_stratify_ratio))
         raw_counts = mg_probs * target_n
         base_counts = np.floor(raw_counts).astype(int)
         remainder = int(target_n - base_counts.sum())
+        # Распределяем остаток по группам с наибольшими дробными частями
         if remainder > 0:
             frac = (raw_counts - base_counts).sort_values(ascending=False)
             for mg in frac.index[:remainder]:
                 base_counts.loc[mg] += 1
 
+        # Выбираем товары из трейна, сохраняя распределение по management_group_id
         selected = []
         selected_set = set()
         for mg, cnt in base_counts.items():
@@ -363,6 +359,7 @@ class PricingModel:
             selected.extend(picks)
             selected_set.update(picks)
 
+        # Если не хватило товаров, добираем случайные из оставшихся
         if len(selected) < self.cfg.proxy_new_products:
             remaining = np.array([p for p in train_products if p not in selected_set])
             extra = rng.choice(remaining, size=self.cfg.proxy_new_products - len(selected), replace=False)
@@ -406,7 +403,7 @@ class PricingModel:
             unc_depth = max(2, self.cfg.unc_depth + depth_offset)
             q_depth = max(2, self.cfg.q_depth + depth_offset)
             
-            # --- 1. Uncertainty Model ---
+            # --- 1. Модель неопределенности ---
             params_unc = {
                 "loss_function": "RMSEWithUncertainty", "iterations": self.cfg.unc_iterations, 
                 "learning_rate": self.cfg.unc_lr, "depth": unc_depth, 
@@ -419,7 +416,7 @@ class PricingModel:
                 params_unc["bagging_temperature"] = bagging_temperature
             if subsample is not None:
                 params_unc["subsample"] = subsample
-            # Proxy Train
+            
             m_unc = CatBoostRegressor(**params_unc)
             m_unc.fit(p_train[features], p_train["log_mid"], cat_features=cat_feats, 
                       eval_set=(p_val[features], p_val["log_mid"]), use_best_model=True)
@@ -427,7 +424,7 @@ class PricingModel:
             preds["p_unc_mu"] += pp[:, 0]
             preds["p_unc_var"] += pp[:, 1]
             
-            # Full Train (re-train on full data with +15% iters)
+            # Переобучаем на полных данных с +15% итераций от лучшей итерации на валидации
             m_unc_full = CatBoostRegressor(**params_unc)
             m_unc_full.set_params(iterations=int(m_unc.get_best_iteration() * 1.15))
             m_unc_full.fit(train_df[features], train_df["log_mid"], cat_features=cat_feats)
@@ -448,14 +445,14 @@ class PricingModel:
                 params_q["bagging_temperature"] = bagging_temperature
             if subsample is not None:
                 params_q["subsample"] = subsample
-            # Proxy Train
+            
             m_q = CatBoostRegressor(**params_q)
             m_q.fit(p_train[features], p_train["log_mid"], cat_features=cat_feats, 
                     eval_set=(p_val[features], p_val["log_mid"]), use_best_model=True)
             pp_q = m_q.predict(p_val[features])
             preds["p_q_p05"] += pp_q[:, 0]; preds["p_q_p50"] += pp_q[:, 1]; preds["p_q_p95"] += pp_q[:, 2]
             
-            # Full Train
+            # Переобучаем на полных данных с +15% итераций от лучшей итерации на валидации
             m_q_full = CatBoostRegressor(**params_q)
             m_q_full.set_params(iterations=int(m_q.get_best_iteration() * 1.15))
             m_q_full.fit(train_df[features], train_df["log_mid"], cat_features=cat_feats)
@@ -469,10 +466,12 @@ class PricingModel:
         # --- КАЛИБРОВКА ---
         print("\n>>> Calibrating & Blending...")
         
-        # Вспомогательная функция для блендинга
+        # Вспомогательная функция для блендинга двух подходов
         def blend_dist(unc_mu, unc_var, q_p05, q_p50, q_p95, w_mu, w_sigma):
             unc_sigma = np.sqrt(np.maximum(unc_var, 1e-9))
+            # Преобразуем квантильный интервал в sigma: (p95 - p05) / (2 * 1.645) ≈ sigma для нормального распределения
             q_sigma = np.maximum((q_p95 - q_p05) / 3.29, 1e-9)
+            # Взвешенное среднее для mu и sigma
             mu = w_mu * unc_mu + (1.0 - w_mu) * q_p50
             sigma = w_sigma * unc_sigma + (1.0 - w_sigma) * q_sigma
             return mu, np.maximum(sigma, 1e-9)
@@ -488,7 +487,6 @@ class PricingModel:
                 for w_sigma in self.cfg.blend_sigma_grid:
                     mu, sig = blend_dist(preds["p_unc_mu"], preds["p_unc_var"], 
                                          preds["p_q_p05"], preds["p_q_p50"], preds["p_q_p95"], w_mu, w_sigma)
-                    # Быстрая оптимизация только глобальных гамм для скорости
                     gl, gh = self._optimize_gammas(mu, sig, p_val["price_p05"].values, p_val["price_p95"].values)
                     p05, p95 = self._get_asymmetric_preds(mu, sig, gl, gh)
                     sc = iou_1d_metric(p_val["price_p05"].values, p_val["price_p95"].values, p05, p95)
@@ -504,16 +502,16 @@ class PricingModel:
                                    preds["t_q_p05"], preds["t_q_p50"], preds["t_q_p95"], 
                                    self.cfg.blend_mu, self.cfg.blend_sigma)
 
-        # 2. Детальная калибровка гамм (Global -> Group -> Cluster)
+        # 2. Детальная калибровка гамм с иерархией: глобальная -> группа -> кластер -> кластер+активность
         calib_state = {}
         
-        # Глобальные
+        # Глобальные гаммы для новых и старых товаров отдельно
         calib_state["glob_new"] = self._optimize_gammas(mu_p[is_new_p], sigma_p[is_new_p], 
                                                         p_val.loc[is_new_p, "price_p05"], p_val.loc[is_new_p, "price_p95"])
         calib_state["glob_old"] = self._optimize_gammas(mu_p[~is_new_p], sigma_p[~is_new_p], 
                                                         p_val.loc[~is_new_p, "price_p05"], p_val.loc[~is_new_p, "price_p95"])
         
-        # По группам (для новых)
+        # По группам для новых товаров (если достаточно данных)
         calib_state["groups"] = {}
         for grp in p_val["management_group_id"].unique():
             mask = is_new_p & (p_val["management_group_id"] == grp)
@@ -521,7 +519,7 @@ class PricingModel:
                 calib_state["groups"][grp] = self._optimize_gammas(mu_p[mask], sigma_p[mask], 
                                                                    p_val.loc[mask, "price_p05"], p_val.loc[mask, "price_p95"])
         
-        # По кластерам (для старых)
+        # По кластерам для старых товаров
         calib_state["clusters"] = {}
         calib_state["clusters_act"] = {}
         for c in clusters:
@@ -529,18 +527,18 @@ class PricingModel:
             if mask.sum() >= self.cfg.min_gamma_samples:
                 calib_state["clusters"][c] = self._optimize_gammas(mu_p[mask], sigma_p[mask], 
                                                                    p_val.loc[mask, "price_p05"], p_val.loc[mask, "price_p95"])
-            # С учетом активности
+            # Дополнительно по активности внутри кластера (акции меняют поведение цен)
             for act in [0, 1]:
                 mask_a = mask & (p_val["activity_flag"] == act)
                 if mask_a.sum() >= self.cfg.min_gamma_samples:
                     calib_state["clusters_act"][(c, act)] = self._optimize_gammas(mu_p[mask_a], sigma_p[mask_a], 
                                                                                   p_val.loc[mask_a, "price_p05"], p_val.loc[mask_a, "price_p95"])
 
-        # Функция применения гамм
+        # Функция применения гамм с иерархией: специфичные -> групповые -> глобальные
         def apply_gammas(df, is_new_mask, gamma_boost=1.0):
             gl_vec, gh_vec = np.zeros(len(df)), np.zeros(len(df))
             
-            # Old
+            # Для старых товаров: кластер -> кластер+активность -> глобальные
             for c in df["cluster_id"].unique():
                 base_gl, base_gh = calib_state["clusters"].get(c, calib_state["glob_old"])
                 for act in [0, 1]:
@@ -548,7 +546,7 @@ class PricingModel:
                     spec_gl, spec_gh = calib_state["clusters_act"].get((c, act), (base_gl, base_gh))
                     gl_vec[mask], gh_vec[mask] = spec_gl, spec_gh
             
-            # New
+            # Для новых товаров: группа -> глобальные (с бустом для учета неопределенности)
             for grp in df.loc[is_new_mask, "management_group_id"].unique():
                 mask = is_new_mask & (df["management_group_id"] == grp)
                 spec_gl, spec_gh = calib_state["groups"].get(grp, calib_state["glob_new"])
@@ -567,7 +565,7 @@ class PricingModel:
             self.cfg.new_gamma_boost = best_boost
             print(f"   Best Gamma Boost: {self.cfg.new_gamma_boost}")
 
-        # 4. Тюнинг сглаживания
+        # 4. Тюнинг сглаживания (разные параметры для старых и новых товаров)
         gl_p, gh_p = apply_gammas(p_val, is_new_p, self.cfg.new_gamma_boost)
         p05_p, p95_p = self._get_asymmetric_preds(mu_p, sigma_p, gl_p, gh_p)
         
@@ -578,7 +576,7 @@ class PricingModel:
                     s05_old, s95_old = self._apply_smoothing(p_val[~is_new_p], p05_p[~is_new_p], p95_p[~is_new_p], ao)
                     s05_new, s95_new = self._apply_smoothing(p_val[is_new_p], p05_p[is_new_p], p95_p[is_new_p], an)
                     
-                    # Собираем обратно (упрощенно для скоринга)
+                    # Собираем обратно в исходном порядке
                     full_05, full_95 = p05_p.copy(), p95_p.copy()
                     full_05[~is_new_p], full_95[~is_new_p] = s05_old, s95_old
                     full_05[is_new_p], full_95[is_new_p] = s05_new, s95_new
@@ -590,13 +588,15 @@ class PricingModel:
 
         # --- ФИНАЛЬНОЕ ПРЕДСКАЗАНИЕ ---
         print(">>> Generating Submission...")
+        # Определяем новые товары в тесте (не встречались в трейне)
         is_new_t = ~test_df["product_id"].isin(train_df["product_id"].unique())
         
+        # Применяем калиброванные гаммы и преобразуем в исходную шкалу
         gl_t, gh_t = apply_gammas(test_df, is_new_t, self.cfg.new_gamma_boost)
         p05_t, p95_t = self._get_asymmetric_preds(mu_t, sigma_t, gl_t, gh_t)
         
         if self.cfg.use_smoothing:
-            # Применяем сглаживание раздельно
+            # Применяем сглаживание раздельно для старых и новых товаров
             if (~is_new_t).sum() > 0:
                 s05, s95 = self._apply_smoothing(test_df[~is_new_t], p05_t[~is_new_t], p95_t[~is_new_t], self.cfg.smoothing_alpha_old)
                 p05_t[~is_new_t], p95_t[~is_new_t] = s05, s95
@@ -617,9 +617,7 @@ def main():
     print("Запуск решения соревнования")
     print("=" * 50)
     
-    # Инициализация и запуск
-    # Системный сид фиксируем везде
-    Config.system_seed = 322 
+    Config.system_seed = 322
     set_seed(Config.system_seed)
     
     model = PricingModel(Config())
