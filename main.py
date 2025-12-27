@@ -25,11 +25,11 @@ class Config:
     test_path: str = "data/test.csv"
     submission_path: str = "results/submission.csv"
 
-    # Сиды для ансамбля (разнообразие) и системный сид (воспроизводимость)
-    system_seed: int = 993
-    ensemble_seeds: Tuple[int, ...] = (42, 993, 777, 2025, 2026)
+    # Ensemble seeds and system seed
+    system_seed: int = 322
+    ensemble_seeds: Tuple[int, ...] = (322, 322, 322, 322, 322, 322, 322, 322, 322)
 
-    train_window_days: int = 60
+    train_window_days: int = 90
 
     # Параметры Uncertainty (CatBoost)
     unc_iterations: int = 3200
@@ -43,6 +43,16 @@ class Config:
     q_depth: int = 6
     q_l2: float = 5.0
 
+    # Ensemble diversity knobs (depth + sampling)
+    ensemble_depth_offsets: Tuple[int, ...] = (-2, -1, 0, 1, 2, -2, -1, 0, 1)
+    ensemble_rsm: Tuple[float, ...] = (0.9, 0.95, 1.0, 0.9, 0.85, 0.8, 0.88, 0.75, 0.92)
+    ensemble_bootstrap: Tuple[str, ...] = (
+        "Bayesian", "Bayesian", "Bernoulli", "Bernoulli", "Bayesian",
+        "Bernoulli", "Bayesian", "Bernoulli", "Bayesian"
+    )
+    ensemble_bagging_temperature: Tuple[Optional[float], ...] = (0.2, 0.7, None, None, 1.5, None, 1.2, None, 0.4)
+    ensemble_subsample: Tuple[Optional[float], ...] = (None, None, 0.7, 0.85, None, 0.6, None, 0.8, None)
+
     # Общие параметры моделей
     min_data_in_leaf: int = 20
     
@@ -54,24 +64,25 @@ class Config:
     min_gamma_samples: int = 10
     blend_mu: float = 0.5
     blend_sigma: float = 0.5
-    new_gamma_boost: float = 1.02
+    new_gamma_boost: float = 1.04
     
     # Сетки поиска (Grid Search)
     tune_blend: bool = True
-    blend_mu_grid: Tuple[float, ...] = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
-    blend_sigma_grid: Tuple[float, ...] = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+    blend_mu_grid: Tuple[float, ...] = (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8)
+    blend_sigma_grid: Tuple[float, ...] = (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8)
     
-    tune_new_gamma_boost: bool = True
-    new_gamma_boost_grid: Tuple[float, ...] = (0.96, 0.98, 1.0, 1.02, 1.04)
+    tune_new_gamma_boost: bool = False
+    new_gamma_boost_grid: Tuple[float, ...] = (0.9, 0.94, 0.96, 0.98, 1.0, 1.02, 1.04, 1.06, 1.08, 1.1)
     
     # Параметры оптимизации Gamma
     gamma_min: float = 0.05
     gamma_max: float = 4.0
-    gamma_steps: int = 120
+    gamma_steps: int = 160
     
     # Валидация
-    proxy_days: int = 28
-    proxy_new_products: int = 150
+    proxy_days: int = 30
+    proxy_new_products: int = 240
+    proxy_stratify_ratio: float = 1.0
     
     # Пост-процессинг (сглаживание)
     use_smoothing: bool = True
@@ -315,8 +326,49 @@ class PricingModel:
         t_dates = dates[:-self.cfg.proxy_days]
         
         # Выделяем "proxy new products" для симуляции холодного старта
-        np.random.seed(self.cfg.system_seed)
-        proxy_prods = np.random.choice(train_df["product_id"].unique(), self.cfg.proxy_new_products, replace=False)
+        rng = np.random.default_rng(self.cfg.system_seed)
+        train_products = train_df["product_id"].unique()
+        train_prod_mode_mg = (
+            train_df.groupby("product_id")["management_group_id"]
+            .agg(lambda s: s.mode().iat[0])
+        )
+        test_new_products = np.setdiff1d(test_df["product_id"].unique(), train_products, assume_unique=False)
+        test_new_mode_mg = (
+            test_df[test_df["product_id"].isin(test_new_products)]
+            .groupby("product_id")["management_group_id"]
+            .agg(lambda s: s.mode().iat[0])
+        )
+        mg_probs = test_new_mode_mg.value_counts(normalize=True)
+
+        target_n = int(round(self.cfg.proxy_new_products * self.cfg.proxy_stratify_ratio))
+        raw_counts = mg_probs * target_n
+        base_counts = np.floor(raw_counts).astype(int)
+        remainder = int(target_n - base_counts.sum())
+        if remainder > 0:
+            frac = (raw_counts - base_counts).sort_values(ascending=False)
+            for mg in frac.index[:remainder]:
+                base_counts.loc[mg] += 1
+
+        selected = []
+        selected_set = set()
+        for mg, cnt in base_counts.items():
+            if cnt <= 0:
+                continue
+            candidates = train_prod_mode_mg[train_prod_mode_mg == mg].index.values
+            if len(candidates) == 0:
+                continue
+            if cnt > len(candidates):
+                cnt = len(candidates)
+            picks = rng.choice(candidates, size=cnt, replace=False).tolist()
+            selected.extend(picks)
+            selected_set.update(picks)
+
+        if len(selected) < self.cfg.proxy_new_products:
+            remaining = np.array([p for p in train_products if p not in selected_set])
+            extra = rng.choice(remaining, size=self.cfg.proxy_new_products - len(selected), replace=False)
+            selected.extend(extra.tolist())
+
+        proxy_prods = np.array(selected)
         
         p_train = train_df[train_df["dt"].isin(t_dates) & (~train_df["product_id"].isin(proxy_prods))]
         p_val = train_df[train_df["dt"].isin(v_dates)]
@@ -329,18 +381,44 @@ class PricingModel:
             "t_q_p05": np.zeros(len(test_df)), "t_q_p50": np.zeros(len(test_df)), "t_q_p95": np.zeros(len(test_df))
         }
 
-        print(f">>> Training Ensemble ({len(self.cfg.ensemble_seeds) * 2} models)...")
-        
-        for seed in tqdm(self.cfg.ensemble_seeds, desc="Seeds"):
+        n_ens = len(self.cfg.ensemble_seeds)
+        if not all(len(x) == n_ens for x in (
+            self.cfg.ensemble_depth_offsets,
+            self.cfg.ensemble_rsm,
+            self.cfg.ensemble_bootstrap,
+            self.cfg.ensemble_bagging_temperature,
+            self.cfg.ensemble_subsample,
+        )):
+            raise ValueError("Ensemble config lengths must match")
+        ensemble_plan = list(zip(
+            self.cfg.ensemble_seeds,
+            self.cfg.ensemble_depth_offsets,
+            self.cfg.ensemble_rsm,
+            self.cfg.ensemble_bootstrap,
+            self.cfg.ensemble_bagging_temperature,
+            self.cfg.ensemble_subsample,
+        ))
+
+        print(f">>> Training Ensemble ({len(ensemble_plan) * 2} models)...")
+
+        for seed, depth_offset, rsm, bootstrap_type, bagging_temperature, subsample in tqdm(ensemble_plan, desc="Ensemble"):
             set_seed(seed)
+            unc_depth = max(2, self.cfg.unc_depth + depth_offset)
+            q_depth = max(2, self.cfg.q_depth + depth_offset)
             
             # --- 1. Uncertainty Model ---
             params_unc = {
                 "loss_function": "RMSEWithUncertainty", "iterations": self.cfg.unc_iterations, 
-                "learning_rate": self.cfg.unc_lr, "depth": self.cfg.unc_depth, 
+                "learning_rate": self.cfg.unc_lr, "depth": unc_depth, 
                 "l2_leaf_reg": self.cfg.unc_l2, "min_data_in_leaf": self.cfg.min_data_in_leaf,
                 "verbose": 0, "random_seed": seed, "task_type": self.task_type, "allow_writing_files": False
             }
+            params_unc["rsm"] = rsm
+            params_unc["bootstrap_type"] = bootstrap_type
+            if bagging_temperature is not None:
+                params_unc["bagging_temperature"] = bagging_temperature
+            if subsample is not None:
+                params_unc["subsample"] = subsample
             # Proxy Train
             m_unc = CatBoostRegressor(**params_unc)
             m_unc.fit(p_train[features], p_train["log_mid"], cat_features=cat_feats, 
@@ -360,10 +438,16 @@ class PricingModel:
             # --- 2. Quantile Model ---
             params_q = {
                 "loss_function": "MultiQuantile:alpha=0.05,0.5,0.95", "iterations": self.cfg.q_iterations,
-                "learning_rate": self.cfg.q_lr, "depth": self.cfg.q_depth, 
+                "learning_rate": self.cfg.q_lr, "depth": q_depth, 
                 "l2_leaf_reg": self.cfg.q_l2, "min_data_in_leaf": self.cfg.min_data_in_leaf,
                 "verbose": 0, "random_seed": seed, "task_type": self.task_type, "allow_writing_files": False
             }
+            params_q["rsm"] = rsm
+            params_q["bootstrap_type"] = bootstrap_type
+            if bagging_temperature is not None:
+                params_q["bagging_temperature"] = bagging_temperature
+            if subsample is not None:
+                params_q["subsample"] = subsample
             # Proxy Train
             m_q = CatBoostRegressor(**params_q)
             m_q.fit(p_train[features], p_train["log_mid"], cat_features=cat_feats, 
@@ -379,7 +463,7 @@ class PricingModel:
             preds["t_q_p05"] += tp_q[:, 0]; preds["t_q_p50"] += tp_q[:, 1]; preds["t_q_p95"] += tp_q[:, 2]
 
         # Усреднение ансамбля
-        n = len(self.cfg.ensemble_seeds)
+        n = len(ensemble_plan)
         for k in preds: preds[k] /= n
         
         # --- КАЛИБРОВКА ---
@@ -535,7 +619,7 @@ def main():
     
     # Инициализация и запуск
     # Системный сид фиксируем везде
-    Config.system_seed = 993 
+    Config.system_seed = 322 
     set_seed(Config.system_seed)
     
     model = PricingModel(Config())
