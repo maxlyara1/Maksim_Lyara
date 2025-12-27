@@ -49,12 +49,14 @@
 
 ```mermaid
 flowchart TD
-    A["Загрузка данных<br/>train.csv, test.csv"] --> B["Подготовка таргетов<br/>mid/spread + log1p"]
+    A["Загрузка данных<br/>train.csv, test.csv"] --> B["Подготовка таргетов<br/>среднее/разброс + логарифм"]
     B --> C["Окно обучения<br/>последние 90 дней"]
-    C --> D1["Кластеризация товаров<br/>KMeans k=5"]
-    C --> D2["Target Encoding<br/>KFold для иерархий"]
-    C --> D3["Контекстные признаки<br/>dow, day, rel_vol, act_x_clust"]
-    C --> D4["Детекция аномалий<br/>IsolationForest"]
+    C --> D["Feature Engineering"]
+    
+    D --> D1["Кластеризация товаров<br/>KMeans k=5"]
+    D --> D2["Target Encoding<br/>KFold для иерархий"]
+    D --> D3["Контекстные признаки<br/>день недели, день месяца,<br/>относительный объем,<br/>взаимодействие активности и кластера"]
+    D --> D4["Детекция аномалий<br/>IsolationForest"]
     
     D1 --> E["Proxy validation split"]
     D2 --> E
@@ -62,11 +64,12 @@ flowchart TD
     D4 --> E
     
     E --> E1["Proxy new products<br/>240 товаров, стратификация"]
-    E --> E2["Train: без последних 30 дней<br/>и без proxy new"]
-    E --> E3["Val: последние 30 дней<br/>включая proxy new"]
+    E1 --> E2["Train: без последних 30 дней<br/>и без proxy new"]
+    E1 --> E3["Val: последние 30 дней<br/>включая proxy new"]
     
     E2 --> F["Обучение ансамбля<br/>9 сидов × 2 типа моделей"]
     E3 --> F
+    E3 --> I["Калибровка гамм<br/>иерархическая<br/>(определение новых товаров)"]
     
     F --> F1["Uncertainty models<br/>RMSEWithUncertainty"]
     F --> F2["Quantile models<br/>MultiQuantile"]
@@ -75,14 +78,14 @@ flowchart TD
     F2 --> F3
     
     F3 --> G["Усреднение предсказаний<br/>18 моделей"]
-    G --> H["Блендинг mu/sigma<br/>grid search весов"]
+    G --> H["Блендинг среднего/дисперсии<br/>grid search весов<br/>(с калибровкой гамм)"]
     H --> I["Калибровка гамм<br/>иерархическая"]
     
     I --> I1["Глобальные: новые/старые"]
     I --> I2["Новые: по management_group_id"]
     I --> I3["Старые: по cluster + activity"]
     
-    I1 --> J["EWM-сглаживание<br/>разные alpha"]
+    I1 --> J["EWM-сглаживание<br/>разные параметры<br/>(тюнинг на val)"]
     I2 --> J
     I3 --> J
     
